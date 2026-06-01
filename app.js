@@ -286,6 +286,7 @@ function renderCard() {
     ? item.tags.map(tag => `<span class="tag-pill">${escapeHtml(tag)}</span>`).join('')
     : '<span class="tag-pill">タグなし</span>';
   els.flashcard.classList.toggle('flipped', state.flipped);
+  resetCardScroll();
   renderEditor();
 }
 
@@ -343,6 +344,20 @@ function renderAll() {
   renderStats();
   renderCard();
   renderList();
+}
+
+function resetCardScroll() {
+  document.querySelectorAll('.face-body').forEach(section => {
+    section.scrollTop = 0;
+  });
+}
+
+function scrollCardIntoView() {
+  if (window.innerWidth > 720 || !els.flashcard) return;
+  requestAnimationFrame(() => {
+    const top = els.flashcard.getBoundingClientRect().top + window.scrollY - 10;
+    window.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
+  });
 }
 
 function toggleFlip(force) {
@@ -501,10 +516,7 @@ function goToIndex(index) {
   state.currentIndex = (index + state.visibleItems.length) % state.visibleItems.length;
   state.flipped = false;
   renderAll();
-  const mainTop = document.querySelector('.topbar');
-  if (window.innerWidth <= 720 && mainTop) {
-    mainTop.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  }
+  scrollCardIntoView();
 }
 
 function nextCard() { goToIndex(state.currentIndex + 1); }
