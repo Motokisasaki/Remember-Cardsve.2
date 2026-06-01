@@ -1,4 +1,4 @@
-const DATA = window.FLASHCARD_DATA;
+const DEFAULT_DATA = window.FLASHCARD_DATA;
 
 const els = {
   categoryFilter: document.getElementById('categoryFilter'),
@@ -36,6 +36,8 @@ const els = {
   speakQuestionBtn: document.getElementById('speakQuestionBtn'),
   speakAnswerBtn: document.getElementById('speakAnswerBtn'),
   stopSpeechBtn: document.getElementById('stopSpeechBtn'),
+  voiceSelect: document.getElementById('voiceSelect'),
+  speechRate: document.getElementById('speechRate'),
   toggleEditorBtn: document.getElementById('toggleEditorBtn'),
   editorPanel: document.getElementById('editorPanel'),
   editAnswerJa: document.getElementById('editAnswerJa'),
@@ -45,20 +47,38 @@ const els = {
   resetEditBtn: document.getElementById('resetEditBtn'),
   speechStatus: document.getElementById('speechStatus'),
   translateStatus: document.getElementById('translateStatus'),
+  excelFileInput: document.getElementById('excelFileInput'),
+  importExcelBtn: document.getElementById('importExcelBtn'),
+  resetImportedDataBtn: document.getElementById('resetImportedDataBtn'),
+  importStatus: document.getElementById('importStatus'),
+  remoteApiUrl: document.getElementById('remoteApiUrl'),
+  remoteAdminKey: document.getElementById('remoteAdminKey'),
+  autoSyncRemote: document.getElementById('autoSyncRemote'),
+  saveRemoteConfigBtn: document.getElementById('saveRemoteConfigBtn'),
+  syncRemoteBtn: document.getElementById('syncRemoteBtn'),
+  remoteStatus: document.getElementById('remoteStatus'),
 };
 
 const STORAGE_KEY = 'gbc_flashcards_ok_map_v1';
-const SETTINGS_KEY = 'gbc_flashcards_settings_v1';
+const SETTINGS_KEY = 'gbc_flashcards_settings_v2';
 const EDITS_KEY = 'gbc_flashcards_answer_edits_v1';
+const IMPORTED_DATA_KEY = 'gbc_flashcards_imported_dataset_v1';
+const REMOTE_CONFIG_KEY = 'gbc_flashcards_remote_config_v1';
+const REMOTE_CACHE_KEY = 'gbc_flashcards_remote_cache_v1';
 
 const state = {
-  allItems: DATA.items,
+  allItems: [],
+  meta: { categories: [], tags: [], totalCount: 0 },
   visibleItems: [],
   currentIndex: 0,
   flipped: false,
-  okMap: loadOkMap(),
+  okMap: loadJson(STORAGE_KEY, {}),
   settings: loadSettings(),
-  editsMap: loadEditsMap(),
+  editsMap: loadJson(EDITS_KEY, {}),
+  importedData: loadJson(IMPORTED_DATA_KEY, null),
+  remoteConfig: loadRemoteConfig(),
+  remotePayload: loadJson(REMOTE_CACHE_KEY, null),
+  remoteSyncTimer: null,
   editorOpen: false,
   touch: {
     startX: 0,
@@ -67,18 +87,20 @@ const state = {
   },
   translateTimer: null,
   translateRequestId: 0,
+  utterances: [],
 };
 
-function loadOkMap() {
+function loadJson(key, fallback) {
   try {
-    return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : fallback;
   } catch {
-    return {};
+    return fallback;
   }
 }
 
-function saveOkMap() {
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(state.okMap));
+function saveJson(key, value) {
+  localStorage.setItem(key, JSON.stringify(value));
 }
 
 function loadSettings() {
@@ -90,12 +112,10 @@ function loadSettings() {
     search: '',
     showJapanese: true,
     autoNext: false,
+    voiceName: 'auto',
+    speechRate: '0.92',
   };
-  try {
-    return { ...defaults, ...(JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}')) };
-  } catch {
-    return defaults;
-  }
+  return { ...defaults, ...loadJson(SETTINGS_KEY, {}) };
 }
 
 function saveSettings() {
@@ -107,21 +127,169 @@ function saveSettings() {
     search: els.searchText.value,
     showJapanese: els.showJapanese.checked,
     autoNext: els.autoNext.checked,
+    voiceName: els.voiceSelect?.value || 'auto',
+    speechRate: els.speechRate?.value || '0.92',
   };
-  localStorage.setItem(SETTINGS_KEY, JSON.stringify(state.settings));
+  saveJson(SETTINGS_KEY, state.settings);
 }
 
-function loadEditsMap() {
-  try {
-    return JSON.parse(localStorage.getItem(EDITS_KEY) || '{}');
-  } catch {
-    return {};
-  }
+function saveOkMap() {
+  saveJson(STORAGE_KEY, state.okMap);
 }
 
 function saveEditsMap() {
-  localStorage.setItem(EDITS_KEY, JSON.stringify(state.editsMap));
+  saveJson(EDITS_KEY, state.editsMap);
 }
+
+function saveImportedData() {
+  saveJson(IMPORTED_DATA_KEY, state.importedData);
+}
+
+function loadRemoteConfig() {
+  return {
+    endpoint: '',
+    adminKey: '',
+    autoSync: true,
+    ...loadJson(REMOTE_CONFIG_KEY, {}),
+  };
+}
+
+function normalizeEndpoint(value) {
+  return String(value || '').trim().replace(/\/+$/, '');
+}
+
+function saveRemoteConfig() {
+  state.remoteConfig = {
+    endpoint: normalizeEndpoint(els.remoteApiUrl?.value || ''),
+    adminKey: String(els.remoteAdminKey?.value || '').trim(),
+    autoSync: Boolean(els.autoSyncRemote?.checked),
+  };
+  saveJson(REMOTE_CONFIG_KEY, state.remoteConfig);
+  scheduleRemoteSync();
+  return state.remoteConfig;
+}
+
+function populateRemoteConfigFields() {
+  if (els.remoteApiUrl) els.remoteApiUrl.value = state.remoteConfig.endpoint || '';
+  if (els.remoteAdminKey) els.remoteAdminKey.value = state.remoteConfig.adminKey || '';
+  if (els.autoSyncRemote) els.autoSyncRemote.checked = state.remoteConfig.autoSync !== false;
+}
+
+function describeRemotePayload(payload) {
+  const count = payload?.itemCount || payload?.dataset?.items?.length || 0;
+  const time = payload?.updatedAt ? new Date(payload.updatedAt).toLocaleString('ja-JP') : '時刻不明';
+  const file = payload?.fileName ? ` / ${payload.fileName}` : '';
+  return `${count}件 / ${time}${file}`;
+}
+
+function setRemoteStatus(message, tone = 'muted') {
+  if (!els.remoteStatus) return;
+  els.remoteStatus.textContent = message;
+  els.remoteStatus.dataset.tone = tone;
+}
+
+function saveRemotePayload(payload) {
+  state.remotePayload = payload;
+  saveJson(REMOTE_CACHE_KEY, payload);
+}
+
+function getRemoteEndpoint() {
+  return normalizeEndpoint(els.remoteApiUrl?.value || state.remoteConfig.endpoint);
+}
+
+function buildRemoteFetchUrl() {
+  const endpoint = getRemoteEndpoint();
+  if (!endpoint) return '';
+  const sep = endpoint.includes('?') ? '&' : '?';
+  return `${endpoint}${sep}_=${Date.now()}`;
+}
+
+async function fetchRemoteDataset({ silent = false } = {}) {
+  const endpoint = getRemoteEndpoint();
+  if (!endpoint) {
+    if (!silent) setRemoteStatus('共有データAPI URLを設定すると、全端末で同じカード内容を使えます。');
+    return null;
+  }
+
+  try {
+    if (!silent) setRemoteStatus('共有データを取得中…', 'loading');
+    const response = await fetch(buildRemoteFetchUrl(), { cache: 'no-store' });
+    if (!response.ok) throw new Error(`http_${response.status}`);
+    const payload = await response.json();
+    if (!payload?.dataset?.items?.length) throw new Error('empty_dataset');
+    return payload;
+  } catch (error) {
+    if (!silent) {
+      setRemoteStatus('共有データの取得に失敗しました。オフライン時は前回同期した内容を利用します。', 'error');
+    }
+    return null;
+  }
+}
+
+function applyRemotePayload(payload, { keepCurrent = true, announce = true } = {}) {
+  if (!payload?.dataset?.items?.length) return false;
+  const keepCurrentId = keepCurrent ? (getCurrentItem()?.id || null) : null;
+  installDataset(payload.dataset, { imported: false });
+  saveRemotePayload(payload);
+  buildFilters();
+  applyFilters(keepCurrentId);
+  if (announce) {
+    setRemoteStatus(`共有データを同期しました（${describeRemotePayload(payload)}）`, 'success');
+  }
+  return true;
+}
+
+async function syncRemoteDataset({ silent = false, force = false } = {}) {
+  const payload = await fetchRemoteDataset({ silent });
+  if (!payload) return false;
+  const currentVersion = state.remotePayload?.version || '';
+  const incomingCount = payload.itemCount || payload.dataset?.items?.length || 0;
+  if (force || payload.version !== currentVersion || incomingCount !== state.allItems.length) {
+    applyRemotePayload(payload, { keepCurrent: true, announce: !silent });
+  } else if (!silent) {
+    setRemoteStatus(`共有データは最新です（${describeRemotePayload(payload)}）`, 'success');
+  }
+  return true;
+}
+
+async function pushDatasetToRemote(dataset, fileName) {
+  const endpoint = getRemoteEndpoint();
+  const adminKey = String(els.remoteAdminKey?.value || state.remoteConfig.adminKey || '').trim();
+  if (!endpoint) return { mode: 'local_only' };
+  if (!adminKey) throw new Error('missing_admin_key');
+
+  saveRemoteConfig();
+  setRemoteStatus('共有データへアップロード中…', 'loading');
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      adminKey,
+      fileName,
+      dataset,
+    }),
+    cache: 'no-store',
+  });
+  if (!response.ok) {
+    if (response.status === 401) throw new Error('unauthorized');
+    throw new Error(`http_${response.status}`);
+  }
+  return response.json();
+}
+
+function scheduleRemoteSync() {
+  if (state.remoteSyncTimer) clearInterval(state.remoteSyncTimer);
+  const config = state.remoteConfig || {};
+  if (!config.endpoint || config.autoSync === false) return;
+  state.remoteSyncTimer = window.setInterval(() => {
+    if (document.visibilityState === 'visible') {
+      syncRemoteDataset({ silent: true });
+    }
+  }, 5 * 60 * 1000);
+}
+
 
 function escapeHtml(value) {
   return String(value)
@@ -132,8 +300,32 @@ function escapeHtml(value) {
     .replaceAll("'", '&#039;');
 }
 
-function isOk(item) {
-  return Boolean(state.okMap[item.id]);
+function normalizeTags(tagsRaw) {
+  return String(tagsRaw || '')
+    .replaceAll('／', '/')
+    .split('/')
+    .map(tag => tag.trim())
+    .filter(Boolean);
+}
+
+function buildMeta(items) {
+  return {
+    totalCount: items.length,
+    categories: [...new Set(items.map(item => item.category).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'ja')),
+    tags: [...new Set(items.flatMap(item => item.tags || []).filter(Boolean))].sort((a, b) => a.localeCompare(b, 'ja')),
+  };
+}
+
+function sortByOriginal(items) {
+  return [...items].sort((a, b) => Number(a.originalNo || 999999) - Number(b.originalNo || 999999));
+}
+
+function installDataset(dataset, { imported = false } = {}) {
+  const safeItems = Array.isArray(dataset?.items) ? dataset.items : [];
+  state.allItems = safeItems;
+  state.meta = dataset?.meta || buildMeta(safeItems);
+  state.importedData = imported ? { meta: state.meta, items: safeItems } : null;
+  saveImportedData();
 }
 
 function getEffectiveItem(item) {
@@ -156,22 +348,258 @@ function getCurrentEffectiveItem() {
   return getEffectiveItem(getCurrentItem());
 }
 
+function isOk(item) {
+  return Boolean(state.okMap[item.id]);
+}
+
 function buildFilters() {
   els.categoryFilter.innerHTML = ['<option value="all">すべてのカテゴリ</option>']
-    .concat(DATA.meta.categories.map(category => `<option value="${escapeHtml(category)}">${escapeHtml(category)}</option>`))
+    .concat(state.meta.categories.map(category => `<option value="${escapeHtml(category)}">${escapeHtml(category)}</option>`))
     .join('');
 
   els.tagFilter.innerHTML = ['<option value="all">すべてのタグ</option>']
-    .concat(DATA.meta.tags.map(tag => `<option value="${escapeHtml(tag)}">${escapeHtml(tag)}</option>`))
+    .concat(state.meta.tags.map(tag => `<option value="${escapeHtml(tag)}">${escapeHtml(tag)}</option>`))
     .join('');
 
   els.categoryFilter.value = state.settings.category || 'all';
+  if (![...els.categoryFilter.options].some(option => option.value === els.categoryFilter.value)) {
+    els.categoryFilter.value = 'all';
+  }
   els.tagFilter.value = state.settings.tag || 'all';
+  if (![...els.tagFilter.options].some(option => option.value === els.tagFilter.value)) {
+    els.tagFilter.value = 'all';
+  }
   els.statusFilter.value = state.settings.status || 'all';
   els.sortMode.value = state.settings.sort || 'original';
   els.searchText.value = state.settings.search || '';
   els.showJapanese.checked = !!state.settings.showJapanese;
   els.autoNext.checked = !!state.settings.autoNext;
+  if (els.speechRate) {
+    els.speechRate.value = state.settings.speechRate || '0.92';
+  }
+}
+
+function populateVoiceOptions() {
+  if (!('speechSynthesis' in window) || !els.voiceSelect) return;
+  const voices = window.speechSynthesis.getVoices().filter(voice => /^en/i.test(voice.lang));
+  const selected = state.settings.voiceName || 'auto';
+  const options = ['<option value="auto">自動で最適な音声を選択</option>']
+    .concat(
+      voices.map(voice => `<option value="${escapeHtml(voice.name)}">${escapeHtml(voice.name)} (${escapeHtml(voice.lang)})</option>`)
+    )
+    .join('');
+  els.voiceSelect.innerHTML = options;
+  els.voiceSelect.value = [...els.voiceSelect.options].some(option => option.value === selected) ? selected : 'auto';
+}
+
+function scoreVoice(voice) {
+  const name = `${voice.name} ${voice.lang}`.toLowerCase();
+  let score = 0;
+  const preferred = ['samantha', 'daniel', 'karen', 'moira', 'ava', 'allison', 'serena', 'siri', 'google us english', 'google uk english female', 'google uk english male', 'microsoft aria', 'microsoft jenny', 'microsoft guy'];
+  preferred.forEach((keyword, index) => {
+    if (name.includes(keyword)) score += 120 - index;
+  });
+  if (voice.localService) score += 20;
+  if (name.includes('female')) score += 6;
+  if (/en-(us|gb|au|ca)/i.test(voice.lang)) score += 10;
+  if (name.includes('compact')) score -= 10;
+  return score;
+}
+
+function resolveVoice() {
+  if (!('speechSynthesis' in window)) return null;
+  const voices = window.speechSynthesis.getVoices().filter(voice => /^en/i.test(voice.lang));
+  if (!voices.length) return null;
+  if (els.voiceSelect?.value && els.voiceSelect.value !== 'auto') {
+    return voices.find(voice => voice.name === els.voiceSelect.value) || null;
+  }
+  return [...voices].sort((a, b) => scoreVoice(b) - scoreVoice(a))[0] || null;
+}
+
+function splitIntoSpeechChunks(text) {
+  return String(text || '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(/(?<=[.!?])\s+|(?<=[。！？])\s*/)
+    .flatMap(sentence => {
+      if (sentence.length <= 180) return sentence ? [sentence] : [];
+      const parts = [];
+      for (let i = 0; i < sentence.length; i += 160) {
+        parts.push(sentence.slice(i, i + 160));
+      }
+      return parts;
+    })
+    .filter(Boolean);
+}
+
+function stopSpeech() {
+  if ('speechSynthesis' in window) {
+    window.speechSynthesis.cancel();
+  }
+  state.utterances = [];
+  if (els.speechStatus) {
+    els.speechStatus.textContent = '読み上げ停止';
+  }
+}
+
+function speakText(text, label) {
+  if (!text || !('speechSynthesis' in window)) {
+    if (els.speechStatus) {
+      els.speechStatus.textContent = 'このブラウザでは高品質読み上げを利用できないか、対象テキストがありません。';
+    }
+    return;
+  }
+
+  const chunks = splitIntoSpeechChunks(text);
+  if (!chunks.length) return;
+
+  stopSpeech();
+  const voice = resolveVoice();
+  const rate = Number(els.speechRate?.value || state.settings.speechRate || 0.92);
+
+  state.utterances = chunks.map((chunk, index) => {
+    const utterance = new SpeechSynthesisUtterance(chunk);
+    utterance.rate = rate;
+    utterance.pitch = 1.0;
+    utterance.volume = 1;
+    utterance.lang = voice?.lang || 'en-US';
+    if (voice) utterance.voice = voice;
+    utterance.onstart = () => {
+      if (els.speechStatus) {
+        const voiceLabel = voice ? ` / ${voice.name}` : '';
+        els.speechStatus.textContent = `${label}を自然音声で読み上げ中${voiceLabel}`;
+      }
+    };
+    utterance.onend = () => {
+      if (index === chunks.length - 1 && els.speechStatus) {
+        els.speechStatus.textContent = `${label}の読み上げが完了しました`;
+      }
+    };
+    utterance.onerror = () => {
+      if (els.speechStatus) {
+        els.speechStatus.textContent = '読み上げに失敗しました。別の英語音声を選ぶと改善することがあります。';
+      }
+    };
+    return utterance;
+  });
+
+  state.utterances.forEach(utterance => window.speechSynthesis.speak(utterance));
+}
+
+function parseWorkbookToDataset(workbook) {
+  const targetName = workbook.SheetNames.includes('Categorized_QA') ? 'Categorized_QA' : workbook.SheetNames[0];
+  const sheet = workbook.Sheets[targetName];
+  const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
+  if (!rows.length) {
+    throw new Error('empty_sheet');
+  }
+
+  const headers = rows[0].map(value => String(value || '').trim());
+  const idx = {
+    category: headers.indexOf('カテゴリ'),
+    tags: headers.indexOf('関連タグ'),
+    questionJa: headers.indexOf('日本語質問'),
+    answerJa: headers.indexOf('日本語回答'),
+    questionEn: headers.indexOf('英語質問'),
+    answerEn: headers.indexOf('英語回答'),
+    originalNo: headers.indexOf('元No.'),
+  };
+
+  if (idx.category < 0 || idx.questionEn < 0 || idx.answerEn < 0) {
+    throw new Error('invalid_headers');
+  }
+
+  const items = rows.slice(1).filter(row => row.some(cell => String(cell || '').trim())).map((row, index) => {
+    const category = String(row[idx.category] || '').trim();
+    const tagsText = String(row[idx.tags] || '').trim();
+    const questionJa = String(row[idx.questionJa] || '').trim();
+    const answerJa = String(row[idx.answerJa] || '').trim();
+    const questionEn = String(row[idx.questionEn] || '').trim();
+    const answerEn = String(row[idx.answerEn] || '').trim();
+    const originalNo = String(row[idx.originalNo] || index + 1).trim();
+    const id = `${category || 'uncategorized'}__${originalNo}__${index + 1}`;
+    return {
+      id,
+      category,
+      tags: normalizeTags(tagsText),
+      tagsText,
+      questionJa,
+      answerJa,
+      questionEn,
+      answerEn,
+      originalNo,
+    };
+  }).filter(item => item.questionEn || item.answerEn);
+
+  const sortedItems = sortByOriginal(items);
+  return {
+    meta: buildMeta(sortedItems),
+    items: sortedItems,
+  };
+}
+
+async function importExcelFile() {
+  const file = els.excelFileInput?.files?.[0];
+  if (!file) {
+    if (els.importStatus) els.importStatus.textContent = '先にExcelファイルを選択してください。';
+    return;
+  }
+  if (typeof XLSX === 'undefined') {
+    if (els.importStatus) els.importStatus.textContent = 'Excel読み込みライブラリの初期化に失敗しました。';
+    return;
+  }
+
+  try {
+    if (els.importStatus) els.importStatus.textContent = `${file.name} を読み込み中…`;
+    const buffer = await file.arrayBuffer();
+    const workbook = XLSX.read(buffer, { type: 'array' });
+    const dataset = parseWorkbookToDataset(workbook);
+    const remoteResult = await pushDatasetToRemote(dataset, file.name);
+
+    state.editsMap = {};
+    saveEditsMap();
+
+    if (remoteResult?.mode === 'local_only') {
+      installDataset(dataset, { imported: true });
+      buildFilters();
+      applyFilters();
+      if (els.importStatus) {
+        els.importStatus.textContent = `${file.name} から ${dataset.items.length} 件のカードを更新しました。共有API未設定のため、この端末だけ更新しています。`;
+      }
+      setRemoteStatus('共有データAPI URLを設定すると、次回から全端末へ自動反映できます。');
+      return;
+    }
+
+    applyRemotePayload(remoteResult, { keepCurrent: false, announce: false });
+    if (els.importStatus) {
+      els.importStatus.textContent = `${file.name} を共有データへ反映しました。${remoteResult.itemCount || dataset.items.length} 件が全端末向けの最新データになります。`;
+    }
+    setRemoteStatus(`共有データを更新しました（${describeRemotePayload(remoteResult)}）`, 'success');
+  } catch (error) {
+    if (els.importStatus) {
+      if (error.message === 'invalid_headers') {
+        els.importStatus.textContent = 'Excelの列名を確認してください。Categorized_QA シートの「カテゴリ / 英語質問 / 英語回答」などが必要です。';
+      } else if (error.message === 'missing_admin_key') {
+        els.importStatus.textContent = '共有APIが設定されていますが、管理キーが未入力です。更新する端末では管理キーを入力してください。';
+      } else if (error.message === 'unauthorized') {
+        els.importStatus.textContent = '管理キーが一致しないため共有データを更新できませんでした。';
+      } else {
+        els.importStatus.textContent = 'Excelの読み込みまたは共有データ反映に失敗しました。ファイル形式または共有API設定を確認してください。';
+      }
+    }
+    if (error.message === 'missing_admin_key' || error.message === 'unauthorized') {
+      setRemoteStatus('共有データの更新に失敗しました。管理キーまたはAPI設定を確認してください。', 'error');
+    }
+  }
+}
+
+function resetImportedDataset() {
+  installDataset(DEFAULT_DATA, { imported: false });
+  buildFilters();
+  applyFilters();
+  if (els.importStatus) {
+    els.importStatus.textContent = 'この端末だけ同梱データに戻しました。共有同期を有効にしている場合、再同期時に共有データへ戻ります。';
+  }
 }
 
 function sortItems(items, mode) {
@@ -191,8 +619,7 @@ function sortItems(items, mode) {
     }
     return copied;
   }
-  copied.sort((a, b) => Number(a.originalNo || 999999) - Number(b.originalNo || 999999));
-  return copied;
+  return sortByOriginal(copied);
 }
 
 function applyFilters(keepCurrentId = null) {
@@ -265,6 +692,38 @@ function renderEmptyState() {
   renderEditor();
 }
 
+function resetCardScroll() {
+  document.querySelectorAll('.face-body').forEach(section => {
+    section.scrollTop = 0;
+  });
+}
+
+function scrollCardIntoView() {
+  if (window.innerWidth > 720 || !els.flashcard) return;
+  requestAnimationFrame(() => {
+    const top = els.flashcard.getBoundingClientRect().top + window.scrollY - 10;
+    window.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
+  });
+}
+
+function renderEditor() {
+  if (!els.editorPanel) return;
+  const item = getCurrentEffectiveItem();
+  if (!item) {
+    els.editorPanel.classList.add('hidden');
+    return;
+  }
+  els.editorPanel.classList.toggle('hidden', !state.editorOpen);
+  if (!state.editorOpen) return;
+  els.editAnswerJa.value = item.answerJa || '';
+  els.editAnswerEn.value = item.answerEn || '';
+  if (els.translateStatus) {
+    els.translateStatus.textContent = navigator.onLine
+      ? '日本語を編集すると、オンライン時に英語回答へ自動反映します。'
+      : 'オフライン中は自動英訳できません。必要に応じて英語欄を直接編集してください。';
+  }
+}
+
 function renderCard() {
   const item = getCurrentEffectiveItem();
   if (!item) {
@@ -322,94 +781,15 @@ function renderList() {
   });
 }
 
-function renderEditor() {
-  if (!els.editorPanel) return;
-  const item = getCurrentEffectiveItem();
-  if (!item) {
-    els.editorPanel.classList.add('hidden');
-    return;
-  }
-  els.editorPanel.classList.toggle('hidden', !state.editorOpen);
-  if (!state.editorOpen) return;
-  els.editAnswerJa.value = item.answerJa || '';
-  els.editAnswerEn.value = item.answerEn || '';
-  if (els.translateStatus) {
-    els.translateStatus.textContent = navigator.onLine
-      ? '日本語を編集すると、オンライン時に英語回答へ自動反映します。'
-      : 'オフライン中は自動英訳できません。必要に応じて英語欄を直接編集してください。';
-  }
-}
-
 function renderAll() {
   renderStats();
   renderCard();
   renderList();
 }
 
-function resetCardScroll() {
-  document.querySelectorAll('.face-body').forEach(section => {
-    section.scrollTop = 0;
-  });
-}
-
-function scrollCardIntoView() {
-  if (window.innerWidth > 720 || !els.flashcard) return;
-  requestAnimationFrame(() => {
-    const top = els.flashcard.getBoundingClientRect().top + window.scrollY - 10;
-    window.scrollTo({ top: Math.max(0, top), behavior: 'smooth' });
-  });
-}
-
 function toggleFlip(force) {
   state.flipped = typeof force === 'boolean' ? force : !state.flipped;
   els.flashcard.classList.toggle('flipped', state.flipped);
-}
-
-function stopSpeech() {
-  if ('speechSynthesis' in window) {
-    window.speechSynthesis.cancel();
-  }
-  if (els.speechStatus) {
-    els.speechStatus.textContent = '読み上げ停止';
-  }
-}
-
-function findEnglishVoice() {
-  if (!('speechSynthesis' in window)) return null;
-  const voices = window.speechSynthesis.getVoices();
-  return voices.find(v => /en[-_](US|GB|AU|CA)/i.test(v.lang))
-    || voices.find(v => /^en/i.test(v.lang))
-    || null;
-}
-
-function speakText(text, label) {
-  if (!text || !('speechSynthesis' in window)) {
-    if (els.speechStatus) {
-      els.speechStatus.textContent = 'このブラウザでは読み上げ機能が利用できないか、対象テキストがありません。';
-    }
-    return;
-  }
-  stopSpeech();
-  const utterance = new SpeechSynthesisUtterance(text);
-  const voice = findEnglishVoice();
-  if (voice) {
-    utterance.voice = voice;
-    utterance.lang = voice.lang;
-  } else {
-    utterance.lang = 'en-US';
-  }
-  utterance.rate = 0.95;
-  utterance.pitch = 1.0;
-  utterance.onstart = () => {
-    if (els.speechStatus) els.speechStatus.textContent = `${label}を読み上げ中`;
-  };
-  utterance.onend = () => {
-    if (els.speechStatus) els.speechStatus.textContent = `${label}の読み上げが完了しました`;
-  };
-  utterance.onerror = () => {
-    if (els.speechStatus) els.speechStatus.textContent = '読み上げに失敗しました。別のブラウザや音声設定をお試しください。';
-  };
-  window.speechSynthesis.speak(utterance);
 }
 
 async function translateJapaneseToEnglish(text) {
@@ -435,7 +815,7 @@ async function runAutoTranslation({ immediate = false } = {}) {
     return;
   }
   if (!navigator.onLine) {
-    if (els.translateStatus) els.translateStatus.textContent = 'オフライン中は自動英訳できません。英語欄を直接編集してください。';
+    if (els.translateStatus) els.translateStatus.textContent = 'オフライン中は自動英訳できません。必要に応じて英語欄を直接編集してください。';
     return;
   }
   try {
@@ -445,7 +825,7 @@ async function runAutoTranslation({ immediate = false } = {}) {
       els.editAnswerEn.value = translated;
       if (els.translateStatus) els.translateStatus.textContent = '英語回答へ自動反映しました。必要に応じて微調整できます。';
     }
-  } catch (error) {
+  } catch {
     if (els.translateStatus) els.translateStatus.textContent = '自動英訳に失敗しました。英語欄を手動で編集してください。';
   }
 }
@@ -457,11 +837,10 @@ function scheduleAutoTranslation() {
 }
 
 function buildEditPayload(item, answerJa, answerEn) {
-  const original = item;
   const trimmedJa = answerJa.trim();
   const trimmedEn = answerEn.trim();
-  const sameJa = trimmedJa === (original.answerJa || '').trim();
-  const sameEn = trimmedEn === (original.answerEn || '').trim();
+  const sameJa = trimmedJa === (item.answerJa || '').trim();
+  const sameEn = trimmedEn === (item.answerEn || '').trim();
   if (sameJa && sameEn) return null;
   return {
     answerJa: trimmedJa,
@@ -519,8 +898,13 @@ function goToIndex(index) {
   scrollCardIntoView();
 }
 
-function nextCard() { goToIndex(state.currentIndex + 1); }
-function prevCard() { goToIndex(state.currentIndex - 1); }
+function nextCard() {
+  goToIndex(state.currentIndex + 1);
+}
+
+function prevCard() {
+  goToIndex(state.currentIndex - 1);
+}
 
 function toggleOkCurrent() {
   const item = getCurrentItem();
@@ -568,11 +952,7 @@ function handleFlashcardTouchEnd(event) {
   const elapsed = Date.now() - state.touch.startTime;
 
   if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy) * 1.3) {
-    if (dx < 0) {
-      nextCard();
-    } else {
-      prevCard();
-    }
+    if (dx < 0) nextCard(); else prevCard();
     return;
   }
 
@@ -585,7 +965,6 @@ function attachEvents() {
   [els.categoryFilter, els.tagFilter, els.statusFilter, els.sortMode].forEach(el => {
     el.addEventListener('change', () => applyFilters(getCurrentItem()?.id || null));
   });
-
   els.searchText.addEventListener('input', () => applyFilters(getCurrentItem()?.id || null));
   els.showJapanese.addEventListener('change', () => {
     saveSettings();
@@ -613,6 +992,9 @@ function attachEvents() {
     if (item) speakText(item.answerEn, '回答');
   });
   els.stopSpeechBtn?.addEventListener('click', stopSpeech);
+  els.voiceSelect?.addEventListener('change', saveSettings);
+  els.speechRate?.addEventListener('input', saveSettings);
+
   els.toggleEditorBtn?.addEventListener('click', () => toggleEditor());
   els.saveEditBtn?.addEventListener('click', saveCurrentEdit);
   els.resetEditBtn?.addEventListener('click', resetCurrentEdit);
@@ -624,6 +1006,20 @@ function attachEvents() {
     }
   });
   els.editAnswerJa?.addEventListener('input', scheduleAutoTranslation);
+
+  els.importExcelBtn?.addEventListener('click', importExcelFile);
+  els.resetImportedDataBtn?.addEventListener('click', resetImportedDataset);
+  els.saveRemoteConfigBtn?.addEventListener('click', async () => {
+    saveRemoteConfig();
+    if (state.remoteConfig.endpoint) {
+      setRemoteStatus('共有設定を保存しました。最新データを確認します…', 'loading');
+      await syncRemoteDataset({ silent: false, force: true });
+    } else {
+      setRemoteStatus('共有設定を保存しました。API URLが未設定のため、この端末だけで動作します。');
+    }
+  });
+  els.syncRemoteBtn?.addEventListener('click', () => syncRemoteDataset({ silent: false, force: true }));
+  els.autoSyncRemote?.addEventListener('change', saveRemoteConfig);
 
   els.cardList.addEventListener('click', event => {
     const button = event.target.closest('[data-jump]');
@@ -652,18 +1048,48 @@ function attachEvents() {
     }
   });
 
-  window.addEventListener('online', renderEditor);
+  window.addEventListener('online', () => {
+    renderEditor();
+    syncRemoteDataset({ silent: true, force: true });
+  });
   window.addEventListener('offline', renderEditor);
-
+  window.addEventListener('focus', () => syncRemoteDataset({ silent: true }));
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      syncRemoteDataset({ silent: true });
+    }
+  });
   if ('speechSynthesis' in window) {
-    window.speechSynthesis.addEventListener?.('voiceschanged', () => {});
+    window.speechSynthesis.addEventListener?.('voiceschanged', populateVoiceOptions);
+    populateVoiceOptions();
+    setTimeout(populateVoiceOptions, 300);
   }
 }
 
 function init() {
+  populateRemoteConfigFields();
+  const cachedRemoteDataset = state.remotePayload?.dataset?.items?.length ? state.remotePayload.dataset : null;
+  const startingData = cachedRemoteDataset || (state.importedData?.items?.length ? state.importedData : DEFAULT_DATA);
+  installDataset(startingData, { imported: Boolean(!cachedRemoteDataset && state.importedData?.items?.length) });
   buildFilters();
   attachEvents();
   applyFilters();
+  scheduleRemoteSync();
+
+  if (cachedRemoteDataset) {
+    setRemoteStatus(`前回同期した共有データを表示中（${describeRemotePayload(state.remotePayload)}）`, 'success');
+    if (els.importStatus) {
+      els.importStatus.textContent = `前回同期した共有データ（${cachedRemoteDataset.items.length}件）を復元しました。`;
+    }
+  } else if (state.importedData?.items?.length && els.importStatus) {
+    els.importStatus.textContent = `前回読み込んだExcelの内容（${state.importedData.items.length}件）を復元しました。`;
+  }
+
+  if (state.remoteConfig.endpoint) {
+    syncRemoteDataset({ silent: false, force: true });
+  } else {
+    setRemoteStatus('共有データAPI URLを設定すると、Excelアップロード内容を全端末へ自動反映できます。');
+  }
 }
 
 init();

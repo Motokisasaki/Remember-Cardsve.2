@@ -1,4 +1,4 @@
-const CACHE_VERSION = 'gbc-flashcards-v4';
+const CACHE_VERSION = 'gbc-flashcards-v7';
 const APP_SHELL = [
   './',
   './index.html',
@@ -6,6 +6,7 @@ const APP_SHELL = [
   './app.js',
   './pwa.js',
   './data.js',
+  './vendor/xlsx.full.min.js',
   './manifest.webmanifest',
   './offline.html',
   './icons/icon-180.png',
@@ -30,7 +31,13 @@ self.addEventListener('activate', event => {
 
 self.addEventListener('fetch', event => {
   const request = event.request;
+  const url = new URL(request.url);
   if (request.method !== 'GET') return;
+
+  if (url.origin !== self.location.origin) {
+    event.respondWith(fetch(request));
+    return;
+  }
 
   if (request.mode === 'navigate') {
     event.respondWith(
